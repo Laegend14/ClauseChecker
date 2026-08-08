@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.claude
+.claude/
+.vscode/
+.idea/
+*.env
+.DS_Store
+
+# Local reference dump, not part of the submission.
+genlayer-docs.txt
+
