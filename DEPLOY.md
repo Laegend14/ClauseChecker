@@ -53,6 +53,18 @@ change it if your Studio instance rejects it.
    storage.
 4. Note the deployed address.
 
+### Existing deployment
+
+If you only want to read an already-deployed instance, skip the above:
+
+| | |
+|---|---|
+| Network | `studionet` (GenLayer Studio) |
+| Address | `0xBD25907Aa4Beca845b9cE5e28A0971edbDB01Dd4` |
+
+Reads need no wallet. Writes — creating policies, submitting, adjudicating — need an
+account funded on the same network.
+
 ---
 
 ## Smoke test after deploying
@@ -167,7 +179,7 @@ Submit a second case with the scope-change paragraph deleted, adjudicate, and co
 | `[EXPECTED] policy is not sealed` on `submit` | Call `seal_policy` first. |
 | `[EXPECTED] policy is sealed` on `add_clause` | Sealed policies are immutable — use `fork_policy`. |
 | `[EXPECTED] only the policy owner may do this` | Policy mutations are restricted to the creating address. |
-| `[LLM_ERROR] model returned no decidable verdicts` | The model returned nothing usable. Validators disagree by design, forcing a retry. |
+| `[LLM_ERROR] model returned no usable verdicts` | The model returned nothing usable (malformed data or fabricated evidence). Validators disagree by design, forcing a retry. |
 | Outcome is `NEEDS_REVIEW` unexpectedly | A blocking clause came back `UNCLEAR`. Check `get_ruling` — usually the clause wording is ambiguous or the subject genuinely doesn't address it. |
 | `[EXPECTED] max adjudication attempts reached` | Three attempts used. Escalate to human review. |
 | Deploy rejected on the `Depends` line | Your Studio runner differs; update the hash to the one your instance reports. |

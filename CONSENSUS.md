@@ -53,28 +53,37 @@ def leader_fn() -> dict:
     parsed = _collect_verdicts(raw, interpretive_ids)
     grounded = _apply_grounding(parsed, subject)
 
-    if all(e["verdict"] == VERDICT_UNCLEAR for e in grounded.values()):
-        raise gl.vm.UserError(f"{ERR_LLM} model returned no decidable verdicts")
-    return grounded
+    if not _response_is_usable(grounded):
+        raise gl.vm.UserError(f"{ERR_LLM} model returned no usable verdicts")
+    return _strip_provenance(grounded)
 ```
 
 Three things happen here, and each one narrows what a model can influence.
 
-**`_collect_verdicts` constrains the output space.** The on-chain policy defines the
-clause set — clause IDs the model invents are discarded, and clauses it omits are filled
-in as `UNCLEAR`. Malformed JSON, wrong types, illegal enum values, and non-list payloads
-all collapse to `UNCLEAR` rather than raising. This is fail-closed: `UNCLEAR` on a
-blocking clause routes the case to `NEEDS_REVIEW`, never to `APPROVED`.
+**`_collect_verdicts` constrains the output space and tracks provenance.** The on-chain policy
+defines the clause set — clause IDs the model invents are discarded, and clauses it omits are filled
+in as `UNCLEAR` with provenance `SRC_DEFAULTED`. Valid enum verdicts for known clauses are tagged
+as `SRC_MODEL`. Malformed JSON, wrong types, and illegal enum values all collapse to `UNCLEAR`
+(`SRC_DEFAULTED`) rather than raising. This is fail-closed: `UNCLEAR` on a blocking clause routes
+the case to `NEEDS_REVIEW`, never to `APPROVED`.
 
 **`_apply_grounding` downgrades unsupported accusations.** A `FAIL` whose evidence quote
-does not appear in the subject becomes `UNCLEAR` with the rationale
+does not appear in the subject becomes `UNCLEAR` with provenance `SRC_DOWNGRADED` and the rationale
 `"Cited evidence not found in subject text; downgraded."` An ungrounded `FAIL` cannot
 reach storage through the honest path.
 
-**The all-`UNCLEAR` guard distinguishes two failures that look alike.** A vector where
-nothing was decidable is not a legitimate reading of the submission — it means the model
-returned something unusable. Raising `[LLM_ERROR]` makes validators disagree, which
-forces a retry with a different leader instead of recording a vacuous ruling.
+**`_response_is_usable` distinguishes undecidability from unusable output.** 
+- When the pinned subject genuinely does not contain enough information to decide any clause,
+  the model returns a complete vector of `UNCLEAR`s (`SRC_MODEL`). This is a legitimate reading
+  of an underdetermined submission: `_response_is_usable` accepts it, and `_aggregate` routes
+  it to `NEEDS_REVIEW`.
+- Conversely, if the model outputs malformed data, omitted all clauses, or fabricated quotes
+  for every single failure (leaving only `SRC_DEFAULTED` or `SRC_DOWNGRADED`), `_response_is_usable`
+  returns `False`. The leader raises `[LLM_ERROR]`, causing validators to disagree and forcing
+  a retry with a different leader rather than recording a vacuous ruling.
+
+Before returning across the consensus boundary, `_strip_provenance` removes the internal
+provenance tags so validators only evaluate clean verdict vectors.
 
 ### Prompt injection posture
 
@@ -312,6 +321,8 @@ Supporting pure functions, all independently testable:
 | `_eval_mechanical` | deterministic predicates, never reaches the LLM |
 | `_aggregate` | **the decision rule** — verdict vector → outcome |
 | `_build_prompt` | prompt assembly and injection posture |
-| `_collect_verdicts` | defensive parsing, fail-closed |
+| `_collect_verdicts` | defensive parsing with provenance tracking, fail-closed |
 | `_apply_grounding` | downgrades unsupported `FAIL`s |
+| `_response_is_usable` | separates underdetermined vectors from unusable/fabricated model output |
+| `_strip_provenance` | drops internal provenance tags before crossing consensus boundary |
 | `_leader_errors_match` | error consensus (§3.5) |

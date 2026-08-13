@@ -756,20 +756,189 @@ def test_validator_rejects_two_drifts_even_when_outcome_is_unchanged(contract, d
     assert drift_scenario(contract, direct_vm, view) is False
 
 
-def test_invented_clause_ids_do_not_count_toward_decidability(contract, direct_vm):
+def test_invented_clause_ids_do_not_count_toward_usability(contract, direct_vm):
     """
     Invented clause IDs are dropped at parse time, not merely at storage time.
 
-    Every real clause comes back UNCLEAR and the model smuggles in one extra PASS. If
-    the phantom survived parsing it would make the vector look partly decidable and
-    suppress the model-failure path; because it is discarded, the leader correctly
-    reports that nothing was decided.
+    The model answers *only* a clause that does not exist. If the phantom survived
+    parsing it would look like a real decision and make an otherwise empty response
+    seem usable; because it is discarded, every real clause is a contract-supplied
+    default and the leader correctly reports that nothing came back.
     """
     build_policy(contract)
-    payload = {clause_id: ("UNCLEAR", "") for clause_id in INTERPRETIVE_IDS}
-    payload["phantom-clause"] = ("PASS", "")
+    direct_vm.mock_llm(r".*", llm_json({"phantom-clause": ("PASS", "")}))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    with direct_vm.expect_revert("LLM_ERROR"):
+        contract.adjudicate(case_id)
+
+
+# --------------------------------------- 6. underdetermined cases vs. model failures
+#
+# An all-UNCLEAR verdict vector has two possible causes that look identical once
+# parsed, and the contract must treat them oppositely:
+#
+#   - the model read the subject and could not decide  -> a real ruling, NEEDS_REVIEW
+#   - the model returned nothing usable                -> [LLM_ERROR], retry
+#
+# These tests pin both directions, since collapsing them is what previously stranded
+# a fully underdetermined case at PENDING until its attempts ran out.
+
+
+VERDICTS_ALL_UNCLEAR = {clause_id: ("UNCLEAR", "") for clause_id in INTERPRETIVE_IDS}
+
+
+def test_complete_unclear_vector_settles_into_needs_review(contract, direct_vm):
+    """
+    A subject that settles nothing is a reviewable outcome, not a failure.
+
+    Every interpretive clause comes back explicitly UNCLEAR. That is a legitimate
+    reading — the pinned text simply does not answer these questions — so the ruling is
+    recorded and `_aggregate` routes the blocking UNCLEARs to NEEDS_REVIEW.
+    """
+    build_policy(contract)
+    direct_vm.mock_llm(r".*", llm_json(VERDICTS_ALL_UNCLEAR))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    contract.adjudicate(case_id)
+
+    ruling = contract.get_ruling(case_id)
+    assert ruling["outcome"] == "NEEDS_REVIEW"
+    assert contract.get_outcome(case_id) == "NEEDS_REVIEW"
+
+    # The full vector is stored, not just the blocking clauses — a reviewer needs to
+    # see that every clause was considered and none was decided.
+    assert {r["clause_id"] for r in ruling["rulings"]} == {c[0] for c in CLAUSES}
+    interpretive = [r for r in ruling["rulings"] if r["clause_id"] in INTERPRETIVE_IDS]
+    assert all(r["verdict"] == "UNCLEAR" for r in interpretive)
+    assert all(r["evidence"] == "" for r in interpretive)
+
+    # It counted as a real attempt and is dated, unlike a retried model failure.
+    assert ruling["attempts"] == 1
+    assert ruling["decided_at"].startswith("2026-03-20")
+
+
+def test_underdetermined_case_reaches_consensus_rather_than_retrying(contract, direct_vm):
+    """
+    The settling path has to survive the validator, not just the leader.
+
+    Both sides independently derive an all-UNCLEAR vector and must agree: no verdict
+    differs, so no drift is spent, and both aggregate to NEEDS_REVIEW.
+    """
+    adjudicated(contract, direct_vm, VERDICTS_ALL_UNCLEAR)
+    assert direct_vm.run_validator() is True
+
+
+def test_one_decided_clause_makes_a_partial_response_usable(contract, direct_vm):
+    """
+    Partial responses are already legitimate, so one real verdict is enough.
+
+    The model answers a single clause and omits the rest. The omissions fail closed to
+    UNCLEAR as always; the response still contains a decision, so it is recorded.
+    """
+    build_policy(contract)
+    direct_vm.mock_llm(r".*", llm_json({"budget-disclosed": ("UNCLEAR", "")}))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    contract.adjudicate(case_id)
+
+    assert contract.get_outcome(case_id) == "NEEDS_REVIEW"
+
+
+def test_illegal_verdict_values_everywhere_are_a_model_failure(contract, direct_vm):
+    """
+    UNCLEAR the contract substituted is not UNCLEAR the model chose.
+
+    Every clause carries a value outside the enum. Each one still fails closed to
+    UNCLEAR, so the stored vector would be indistinguishable from a genuine
+    all-UNCLEAR reading — but nothing here was decided, so this must retry.
+    """
+    build_policy(contract)
+    payload = {clause_id: ("DEFINITELY_YES", "") for clause_id in INTERPRETIVE_IDS}
     direct_vm.mock_llm(r".*", llm_json(payload))
 
     case_id = contract.submit("grant-milestone", SUBJECT, "")
     with direct_vm.expect_revert("LLM_ERROR"):
         contract.adjudicate(case_id)
+
+
+def test_wholly_fabricated_failures_are_a_model_failure(contract, direct_vm):
+    """
+    A response whose every citation was invented has nothing the contract accepted.
+
+    Each clause comes back FAIL quoting text absent from the subject, so grounding
+    downgrades all of them to UNCLEAR. Recording that as NEEDS_REVIEW would let total
+    fabrication settle as a routine outcome; a retry may yet produce a real answer.
+    """
+    build_policy(contract)
+    payload = {
+        clause_id: ("FAIL", "the team admitted to falsifying the entire budget report")
+        for clause_id in INTERPRETIVE_IDS
+    }
+    direct_vm.mock_llm(r".*", llm_json(payload))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    with direct_vm.expect_revert("LLM_ERROR"):
+        contract.adjudicate(case_id)
+
+
+def test_one_grounded_failure_survives_amid_fabrications(contract, direct_vm):
+    """
+    The usability test asks whether *anything* was accepted, not whether all was.
+
+    One clause cites real text; the others fabricate. The fabrications are downgraded
+    and the grounded FAIL stands, so the case is decided rather than retried — and on a
+    MAJOR clause with no allowance, that means REJECTED.
+    """
+    build_policy(contract)
+    payload = {
+        clause_id: ("FAIL", "the team admitted to falsifying the entire budget report")
+        for clause_id in INTERPRETIVE_IDS
+    }
+    payload["no-unapproved-scope-change"] = (
+        "FAIL",
+        "replaced the originally agreed Postgres backend with ClickHouse without",
+    )
+    direct_vm.mock_llm(r".*", llm_json(payload))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    contract.adjudicate(case_id)
+
+    ruling = contract.get_ruling(case_id)
+    assert ruling["outcome"] == "REJECTED"
+    scope = next(r for r in ruling["rulings"] if r["clause_id"] == "no-unapproved-scope-change")
+    assert scope["verdict"] == "FAIL"
+
+
+def test_empty_verdict_list_is_a_model_failure(contract, direct_vm):
+    """A well-formed envelope carrying no verdicts decided nothing."""
+    build_policy(contract)
+    direct_vm.mock_llm(r".*", json.dumps({"verdicts": []}))
+
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    with direct_vm.expect_revert("LLM_ERROR"):
+        contract.adjudicate(case_id)
+
+
+def test_underdetermined_case_can_be_readjudicated_once_clarified(contract, direct_vm):
+    """
+    Settling into NEEDS_REVIEW must not be a dead end.
+
+    An underdetermined case stays open to re-adjudication, so the same pinned subject
+    can be re-run against a better model without forking the policy or resubmitting.
+    """
+    build_policy(contract)
+    direct_vm.mock_llm(r".*", llm_json(VERDICTS_ALL_UNCLEAR))
+    case_id = contract.submit("grant-milestone", SUBJECT, "")
+    contract.adjudicate(case_id)
+    assert contract.get_outcome(case_id) == "NEEDS_REVIEW"
+
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", llm_json(VERDICTS_ALL_CLEAN))
+    contract.adjudicate(case_id)
+
+    ruling = contract.get_ruling(case_id)
+    assert ruling["outcome"] == "APPROVED"
+    assert ruling["attempts"] == 2
+    # Rewritten wholesale: no UNCLEAR rows left over from the first pass.
+    assert all(r["verdict"] != "UNCLEAR" for r in ruling["rulings"])

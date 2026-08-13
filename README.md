@@ -189,7 +189,7 @@ independent.
 | Path | |
 |---|---|
 | [`contracts/ClauseCheck.py`](contracts/ClauseCheck.py) | the contract |
-| [`tests/test_clausecheck.py`](tests/test_clausecheck.py) | 51 Direct Mode tests |
+| [`tests/test_clausecheck.py`](tests/test_clausecheck.py) | 59 Direct Mode tests |
 | [`tools/mutation_test.py`](tools/mutation_test.py) | disables each guard, checks the suite notices |
 | [`CONSENSUS.md`](CONSENSUS.md) | consensus design and threat model |
 | [`DEPLOY.md`](DEPLOY.md) | GenLayer Studio deployment walkthrough |
