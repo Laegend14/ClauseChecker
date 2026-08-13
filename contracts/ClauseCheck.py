@@ -79,6 +79,15 @@ VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_UNCLEAR = "UNCLEAR"  # subject text does not settle the question
 
+# Where a clause's verdict came from. Two very different situations produce an
+# all-UNCLEAR vector — a model that read the subject and could not decide, and a model
+# that returned nothing usable — and the verdicts alone cannot tell them apart. This
+# records which, so `_response_is_usable` can. Internal to parsing: stripped before the
+# vector crosses the consensus boundary (see `_strip_provenance`).
+SRC_MODEL = "MODEL"  # the model returned a verdict the contract accepted as given
+SRC_DEFAULTED = "DEFAULTED"  # contract filled in UNCLEAR: clause omitted, or illegal value
+SRC_DOWNGRADED = "DOWNGRADED"  # model said FAIL; its evidence was not in the subject
+
 # Case-level outcomes, computed by `_aggregate`, never by a model.
 OUTCOME_PENDING = "PENDING"
 OUTCOME_APPROVED = "APPROVED"
@@ -330,6 +339,10 @@ def _collect_verdicts(raw: typing.Any, clause_ids: list[str]) -> dict[str, dict]
     blocking clause routes the case to NEEDS_REVIEW instead of silently approving it.
     Unknown clause IDs are dropped: the on-chain policy defines the clause set, not
     the model.
+
+    Each entry also records where its verdict came from, because a UNCLEAR the model
+    chose and a UNCLEAR this function substituted mean opposite things about whether the
+    response was usable at all. See `_response_is_usable`.
     """
     if isinstance(raw, str):
         try:
@@ -352,8 +365,13 @@ def _collect_verdicts(raw: typing.Any, clause_ids: list[str]) -> dict[str, dict]
             continue  # model invented a clause — discard it
 
         verdict = entry.get("verdict")
-        if verdict not in (VERDICT_PASS, VERDICT_FAIL, VERDICT_UNCLEAR):
+        if verdict in (VERDICT_PASS, VERDICT_FAIL, VERDICT_UNCLEAR):
+            source = SRC_MODEL
+        else:
+            # An illegal enum value is not a decision. Fail closed to UNCLEAR, but do
+            # not credit the model with having answered this clause.
             verdict = VERDICT_UNCLEAR
+            source = SRC_DEFAULTED
 
         evidence = entry.get("evidence")
         if not isinstance(evidence, str):
@@ -367,6 +385,7 @@ def _collect_verdicts(raw: typing.Any, clause_ids: list[str]) -> dict[str, dict]
             "verdict": verdict,
             "evidence": evidence,
             "rationale": rationale[:400],
+            "source": source,
         }
 
     # Fail closed on omission.
@@ -376,6 +395,7 @@ def _collect_verdicts(raw: typing.Any, clause_ids: list[str]) -> dict[str, dict]
                 "verdict": VERDICT_UNCLEAR,
                 "evidence": "",
                 "rationale": "No verdict returned for this clause.",
+                "source": SRC_DEFAULTED,
             }
 
     return parsed
@@ -397,18 +417,70 @@ def _apply_grounding(verdicts: dict[str, dict], subject: str) -> dict[str, dict]
         verdict = entry["verdict"]
         evidence = entry["evidence"]
         rationale = entry["rationale"]
+        source = entry["source"]
 
         if verdict == VERDICT_FAIL and not _quote_is_grounded(subject, evidence):
             verdict = VERDICT_UNCLEAR
             rationale = "Cited evidence not found in subject text; downgraded."
             evidence = ""
+            source = SRC_DOWNGRADED
 
         grounded[clause_id] = {
             "verdict": verdict,
             "evidence": evidence,
             "rationale": rationale,
+            "source": source,
         }
     return grounded
+
+
+def _response_is_usable(verdicts: dict[str, dict]) -> bool:
+    """
+    Did the model decide anything the contract was willing to accept?
+
+    This separates two situations that produce byte-identical verdict vectors, and
+    getting them confused is what stranded fully underdetermined cases:
+
+      - The model read the subject and answered UNCLEAR on every clause, because the
+        pinned text genuinely does not settle any of them. That is a real reading and
+        must be recorded — `_aggregate` turns a blocking UNCLEAR into NEEDS_REVIEW,
+        which is precisely the outcome an underdetermined case should reach.
+      - The model returned nothing usable: unparseable output, an empty or non-list
+        payload, only invented clause IDs, illegal enum values, or FAILs whose every
+        citation was fabricated. The UNCLEARs are then this contract's own fail-closed
+        substitutions, not the model's judgment. There is no ruling to record, so the
+        leader raises and validators force a retry with a different leader.
+
+    Only verdicts taken at face value count. A downgraded FAIL does not: the model did
+    decide, and the contract rejected that decision as unfounded, so nothing it said
+    survived. A response whose every accusation was fabricated is worth retrying, not
+    recording — otherwise fabrication launders itself into a routine NEEDS_REVIEW.
+
+    One accepted verdict is enough. Partial responses are already legitimate here —
+    `_collect_verdicts` fills an omitted clause with UNCLEAR by design — so the only
+    principled line is between a model that contributed something and one that
+    contributed nothing.
+    """
+    return any(entry["source"] == SRC_MODEL for entry in verdicts.values())
+
+
+def _strip_provenance(verdicts: dict[str, dict]) -> dict[str, dict]:
+    """
+    Drop provenance before the vector leaves the leader.
+
+    Provenance answers "was this response usable", which is settled inside `leader_fn`
+    before anything crosses the consensus boundary. Validators compare verdicts,
+    evidence, and the aggregate outcome — never provenance — so returning it would put a
+    field in the leader's calldata that nothing checks and nothing stores.
+    """
+    return {
+        clause_id: {
+            "verdict": entry["verdict"],
+            "evidence": entry["evidence"],
+            "rationale": entry["rationale"],
+        }
+        for clause_id, entry in verdicts.items()
+    }
 
 
 def _leader_errors_match(leader_result: typing.Any, leader_fn: typing.Any) -> bool:
@@ -715,14 +787,16 @@ class ClauseCheck(gl.Contract):
             parsed = _collect_verdicts(raw, interpretive_ids)
             grounded = _apply_grounding(parsed, subject)
 
-            # If the model resolved nothing at all, this is a model failure, not a
-            # legitimate "the text doesn't say". Raise so validators force a retry
-            # instead of letting a vacuous all-UNCLEAR vector reach storage.
-            if all(e["verdict"] == VERDICT_UNCLEAR for e in grounded.values()):
+            # Retry only when the model gave us nothing to record. A vector of UNCLEARs
+            # the model actually chose is a valid ruling — the subject does not settle
+            # these clauses — and `_aggregate` routes it to NEEDS_REVIEW. Raising on it
+            # would strand a genuinely underdetermined case at PENDING until its
+            # attempts ran out, which is a worse answer than "a human should look".
+            if not _response_is_usable(grounded):
                 raise gl.vm.UserError(
-                    f"{ERR_LLM} model returned no decidable verdicts"
+                    f"{ERR_LLM} model returned no usable verdicts"
                 )
-            return grounded
+            return _strip_provenance(grounded)
 
         def validator_fn(leader_result: typing.Any) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
